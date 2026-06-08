@@ -7,7 +7,7 @@ from config import settings
 from models import (
     EnvironmentMonitor, EvacuationOrder, Alert, AlertLevel, User,
     SafetyEvent, SafetyEventStatus, EvacuationConfirmation, UserRole,
-    SafetyActionType, WorkOrder, WorkOrderStatus
+    SafetyActionType, WorkOrder, WorkOrderStatus, MinerLocationReport
 )
 from routers.safety import log_safety_action
 from schemas import (
@@ -22,19 +22,38 @@ from services.notification_service import (
 router = APIRouter(prefix="/environment", tags=["环境监测与应急调度"])
 
 
-def _init_evacuation_confirmations(db: Session, evac_id: int):
+def _init_evacuation_confirmations(db: Session, evac_id: int, evac_area: Optional[str]):
     existing = db.query(EvacuationConfirmation).filter(
         EvacuationConfirmation.evacuation_id == evac_id
     ).first()
     if existing:
         return
+    from routers.equipment import ADJACENT_AREAS
+    adjacent_areas = ADJACENT_AREAS.get(evac_area, [])
+    target_areas = {evac_area} | set(adjacent_areas) if evac_area else None
+
     miners = db.query(User).filter(
         User.role == UserRole.MINER,
         User.is_active == True
     ).all()
     for m in miners:
-        conf = EvacuationConfirmation(evacuation_id=evac_id, user_id=m.id, confirmed=False)
-        db.add(conf)
+        latest_loc = db.query(MinerLocationReport).filter(
+            MinerLocationReport.user_id == m.id
+        ).order_by(MinerLocationReport.reported_at.desc()).first()
+        user_area = latest_loc.area if latest_loc else getattr(m, 'location_tag_id', None)
+
+        include = False
+        if not evac_area or not user_area:
+            include = True
+        elif target_areas and user_area in target_areas:
+            include = True
+        if include:
+            conf = EvacuationConfirmation(
+                evacuation_id=evac_id, user_id=m.id,
+                area=user_area or evac_area,
+                confirmed=False
+            )
+            db.add(conf)
     db.commit()
 
 
@@ -158,7 +177,7 @@ async def upload_environment_data(
             db.add(evacuation)
             db.flush()
             evacuation_id = evacuation.id
-            _init_evacuation_confirmations(db, evacuation_id)
+            _init_evacuation_confirmations(db, evacuation_id, data.area)
         else:
             evacuation_id = existing_evacuation.id
 

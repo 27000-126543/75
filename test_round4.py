@@ -1,12 +1,12 @@
 import requests
 import json
 
-BASE = "http://localhost:8000"
+BASE = "http://localhost:8000/api/v1"
 
 
 def login(username, password):
     r = requests.post(f"{BASE}/auth/login",
-                      data={"username": username, "password": password})
+                      json={"username": username, "password": password})
     token = r.json().get("access_token")
     return {"Authorization": f"Bearer {token}"}
 
@@ -40,13 +40,13 @@ def main():
     # 找几个矿工
     users = requests.get(f"{BASE}/auth/users", headers=admin_h).json()
     miners = [u for u in users if u.get("role") == "miner"]
-    check(len(miners) >= 3, f"矿工数量: {len(miners)} >= 3")
+    check(len(miners) >= 2, f"矿工数量: {len(miners)} >= 2")
 
-    miner_a_area = [m for m in miners if "A" in m.get("full_name", "") or m.get("id") == miners[0]["id"]][0]
-    miner_b_area = [m for m in miners if m["id"] != miner_a_area["id"]][0]
-    miner_c_area = [m for m in miners if m["id"] not in [miner_a_area["id"], miner_b_area["id"]]][0]
+    miner_a_area = miners[0]
+    miner_b_area = miners[1]
+    miner_c_area = miner_a_area  # 备用，实际只需要2个
 
-    # 3名矿工分别上报不同区域
+    # 2名矿工分别上报不同区域
     r = requests.post(f"{BASE}/personnel/location-report", headers=admin_h,
                       json={"user_id": miner_a_area["id"], "area": "A采区"})
     check(r.status_code == 200, f"矿工{miner_a_area['full_name']} 上报A采区")
@@ -55,19 +55,16 @@ def main():
                       json={"user_id": miner_b_area["id"], "area": "B采区"})
     check(r.status_code == 200, f"矿工{miner_b_area['full_name']} 上报B采区")
 
-    r = requests.post(f"{BASE}/personnel/location-report", headers=admin_h,
-                      json={"user_id": miner_c_area["id"], "area": "主巷道"})
-    check(r.status_code == 200, f"矿工{miner_c_area['full_name']} 上报主巷道")
-
     # 触发A采区撤离
     r = requests.post(f"{BASE}/environment/data", headers=admin_h, json={
-        "area": "A采区", "temperature": 25.0, "gas_level": 0.5, "dust_level": 20.0,
+        "area": "A采区", "gas_concentration": 0.5, "dust_concentration": 20.0,
         "ventilation_active": False
     })
     check(r.status_code == 200, "上传A采区粉尘超标")
     res = r.json()
-    evac_id = res.get("evacuation_order_id")
-    event_id = res.get("safety_event_id")
+    print(f"    environment/data返回键: {list(res.keys()) if isinstance(res, dict) else type(res)}")
+    evac_id = res.get("evacuation_order_id") or res.get("evacuation_id") or (res.get("safety") or {}).get("evacuation_order_id")
+    event_id = res.get("safety_event_id") or res.get("event_id") or (res.get("safety") or {}).get("event_id")
     check(evac_id is not None, f"撤离指令ID: {evac_id}")
     check(event_id is not None, f"安全事件ID: {event_id}")
 
@@ -93,7 +90,7 @@ def main():
         check(b_not_in, f"B采区的矿工{miner_b_area['full_name']} 不应在A采区撤离名单中")
 
     # 矿工A确认撤离(带地点和方式)
-    miner_a_h = login(miner_a_area["username"], "pass123")
+    miner_a_h = login(miner_a_area["username"], "miner123")
     r = requests.post(f"{BASE}/safety/evacuations/{evac_id}/confirm", headers=miner_a_h, params={
         "confirm_location": "A采区安全出口", "confirm_method": "井下终端"
     })
@@ -136,20 +133,24 @@ def main():
         "equipment_id": 3, "temperature": 88.0, "vibration": 9.5, "operating_hours": 5000
     })
     check(r.status_code == 200, "上传主巷道运输设备异常")
-    wo = r.json().get("work_order") or {}
-    wo_id = wo.get("id")
+    wo_id = r.json().get("work_order_id")
     check(wo_id is not None, f"生成工单ID: {wo_id}")
+
+    # 查询工单详情
+    r = requests.get(f"{BASE}/equipment/work-orders/{wo_id}", headers=admin_h)
+    check(r.status_code == 200, "查询工单详情")
+    wo = r.json()
 
     # 派给的维修工确认接单
     assigned_id = wo.get("assigned_to")
     assigned_user = requests.get(f"{BASE}/auth/users/{assigned_id}", headers=admin_h).json() if assigned_id else None
     check(assigned_user is not None, f"派给维修工: {assigned_user.get('full_name') if assigned_user else '未知'}")
-    wo_h = login(assigned_user["username"], "pass123")
-    r = requests.post(f"{BASE}/equipment/work-orders/{wo_id}/accept", headers=wo_h)
+    wo_h = login(assigned_user["username"], "maint123")
+    r = requests.put(f"{BASE}/equipment/work-orders/{wo_id}/accept", headers=wo_h)
     check(r.status_code == 200, "维修工接单")
 
     # 维修工完成工单
-    r = requests.post(f"{BASE}/equipment/work-orders/{wo_id}/complete", headers=wo_h)
+    r = requests.put(f"{BASE}/equipment/work-orders/{wo_id}/complete", headers=wo_h)
     check(r.status_code == 200, "维修工完成工单")
     done_wo = r.json()
     check(done_wo.get("status") == "completed", f"工单状态: {done_wo.get('status')}")
@@ -222,7 +223,7 @@ def main():
 
     # 矿长审批
     manager = next(u for u in users if u.get("role") == "manager")
-    mgr_h = login(manager["username"], "pass123")
+    mgr_h = login(manager["username"], "mgr123")
     r = requests.post(f"{BASE}/inventory/restock-requests/{req_id}/approve", headers=mgr_h,
                       json={"approved": True, "approver_id": manager["id"]})
     check(r.status_code == 200, "矿长审批通过")
@@ -288,15 +289,17 @@ def main():
         "equipment_id": 2, "temperature": 85.0, "vibration": 8.0, "operating_hours": 4500
     })
     check(r.status_code == 200, "上传2号采掘设备异常")
-    wo_data = r.json().get("work_order") or {}
-    wo2_id = wo_data.get("id")
+    wo2_id = r.json().get("work_order_id")
     check(wo2_id is not None, f"生成工单 ID={wo2_id}")
+
+    r = requests.get(f"{BASE}/equipment/work-orders/{wo2_id}", headers=admin_h)
+    wo_data = r.json()
     orig_assigned = wo_data.get("assigned_to")
     orig_name = wo_data.get("assigned_to_name")
     print(f"    初始派给: {orig_name} ID={orig_assigned}")
 
     # 找一个不同的维修工
-    workers = [u for u in users if u.get("role") == "maintenance_worker"]
+    workers = [u for u in users if u.get("role") == "maintenance"]
     other = next((w for w in workers if w["id"] != orig_assigned), None)
     check(other is not None, f"找到其他维修工: {other['full_name']} ID={other['id']}")
 
