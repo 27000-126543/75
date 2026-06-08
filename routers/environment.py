@@ -289,14 +289,20 @@ async def cancel_evacuation(
         SafetyEvent.related_evacuation_id == evac_id
     ).first()
     if event:
-        all_resolved = True
         if event.related_alert_id:
             alert = db.query(Alert).filter(Alert.id == event.related_alert_id).first()
             if alert and not alert.is_resolved:
-                all_resolved = False
+                alert.is_resolved = True
+                alert.resolved_at = datetime.utcnow()
         if event.related_work_order_id:
-            wo = db.query(SafetyEvent.related_work_order_id).first()
-            if wo and wo.status != "completed":
+            from models import WorkOrder, WorkOrderStatus
+            wo = db.query(WorkOrder).filter(WorkOrder.id == event.related_work_order_id).first()
+            if wo and wo.status != WorkOrderStatus.COMPLETED:
+                pass
+        all_resolved = True
+        if event.related_work_order_id:
+            wo = db.query(WorkOrder).filter(WorkOrder.id == event.related_work_order_id).first()
+            if wo and wo.status != WorkOrderStatus.COMPLETED:
                 all_resolved = False
         if all_resolved:
             event.status = SafetyEventStatus.RESOLVED

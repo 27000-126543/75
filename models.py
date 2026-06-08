@@ -231,6 +231,15 @@ class RestockRequest(Base):
     approver_id = Column(Integer, ForeignKey("users.id"))
     approved_at = Column(DateTime)
     supplier_notified = Column(Boolean, default=False)
+    shipment_status = Column(SQLEnum(ShipmentStatus), default=ShipmentStatus.PENDING_APPROVAL)
+    supplier_confirmed_at = Column(DateTime)
+    tracking_number = Column(String(100))
+    shipped_at = Column(DateTime)
+    delivered_at = Column(DateTime)
+    received_quantity = Column(Float, default=0)
+    received_by = Column(Integer, ForeignKey("users.id"))
+    received_at = Column(DateTime)
+    received_remark = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -300,9 +309,14 @@ class EvacuationConfirmation(Base):
     id = Column(Integer, primary_key=True, index=True)
     evacuation_id = Column(Integer, ForeignKey("evacuation_orders.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    area = Column(String(100))
     confirmed = Column(Boolean, default=False)
     confirmed_at = Column(DateTime)
+    confirm_location = Column(String(200))
+    confirm_method = Column(String(50))
     reminder_sent = Column(Boolean, default=False)
+    reminder_sent_at = Column(DateTime)
+    reminder_message_id = Column(Integer)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -320,3 +334,53 @@ class MaintenanceWorkerState(Base):
     current_area = Column(String(100))
     eta_minutes = Column(Integer, default=0)
     last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SafetyActionType(str, enum.Enum):
+    ALERT_TRIGGERED = "alert_triggered"
+    VENTILATION_STARTED = "ventilation_started"
+    EVACUATION_ISSUED = "evacuation_issued"
+    EVACUATION_CONFIRMED = "evacuation_confirmed"
+    EVACUATION_TIMEOUT = "evacuation_timeout"
+    EVACUATION_CANCELLED = "evacuation_cancelled"
+    WORK_ORDER_CREATED = "work_order_created"
+    WORK_ORDER_ASSIGNED = "work_order_assigned"
+    WORK_ORDER_ACCEPTED = "work_order_accepted"
+    WORK_ORDER_REJECTED = "work_order_rejected"
+    WORK_ORDER_REASSIGNED = "work_order_reassigned"
+    WORK_ORDER_COMPLETED = "work_order_completed"
+    EVENT_RESOLVED = "event_resolved"
+    NOTE = "note"
+
+
+class SafetyEventActionLog(Base):
+    __tablename__ = "safety_event_action_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    safety_event_id = Column(Integer, ForeignKey("safety_events.id"), nullable=False)
+    action_type = Column(SQLEnum(SafetyActionType), nullable=False)
+    actor_user_id = Column(Integer, ForeignKey("users.id"))
+    actor_name = Column(String(100))
+    description = Column(Text)
+    detail_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ShipmentStatus(str, enum.Enum):
+    PENDING_APPROVAL = "pending_approval"
+    APPROVED_WAITING_SUPPLIER = "approved_waiting_supplier"
+    IN_TRANSIT = "in_transit"
+    DELIVERED = "delivered"
+    RECEIVED = "received"
+    CANCELLED = "cancelled"
+
+
+class WorkOrderReassignment(Base):
+    __tablename__ = "work_order_reassignments"
+    id = Column(Integer, primary_key=True, index=True)
+    work_order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=False)
+    from_user_id = Column(Integer, ForeignKey("users.id"))
+    from_user_name = Column(String(100))
+    to_user_id = Column(Integer, ForeignKey("users.id"))
+    to_user_name = Column(String(100))
+    reason = Column(String(500))
+    created_at = Column(DateTime, default=datetime.utcnow)

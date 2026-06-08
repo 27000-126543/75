@@ -7,7 +7,8 @@ from config import settings
 from models import (
     MiningEquipment, EquipmentData, WorkOrder,
     WorkOrderStatus, User, UserRole, Alert, AlertLevel,
-    MaintenanceWorkerState, WorkerStatus, SafetyEvent, SafetyEventStatus
+    MaintenanceWorkerState, WorkerStatus, SafetyEvent, SafetyEventStatus,
+    EvacuationOrder
 )
 from schemas import (
     MiningEquipmentCreate, MiningEquipmentResponse,
@@ -190,19 +191,20 @@ def _resolve_safety_event_for_work_order(db: Session, work_order_id: int):
     ).first()
     if not event:
         return
-    all_resolved = True
     if event.related_alert_id:
         alert = db.query(Alert).filter(Alert.id == event.related_alert_id).first()
         if alert and not alert.is_resolved:
-            all_resolved = False
+            alert.is_resolved = True
+            alert.resolved_at = datetime.utcnow()
+    all_resolved = True
     if event.related_evacuation_id:
-        evac = db.query(SafetyEvent.related_evacuation_id).first()
+        evac = db.query(EvacuationOrder).filter(EvacuationOrder.id == event.related_evacuation_id).first()
         if evac and evac.is_active:
             all_resolved = False
     if all_resolved:
         event.status = SafetyEventStatus.RESOLVED
         event.resolved_at = datetime.utcnow()
-        db.commit()
+    db.commit()
 
 
 @router.post("/equipments", response_model=MiningEquipmentResponse, status_code=201)
