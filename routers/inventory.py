@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
@@ -21,7 +21,7 @@ from services.notification_service import (
 router = APIRouter(prefix="/inventory", tags=["物资库存管理"])
 
 
-def _check_and_create_restock(db: Session, item: SupplyItem, applicant_id: Optional[int] = None):
+async def _check_and_create_restock(db: Session, item: SupplyItem, applicant_id: Optional[int] = None):
     safety_line = item.safety_stock
     if item.current_stock < safety_line:
         existing = db.query(RestockRequest).filter(
@@ -49,6 +49,8 @@ def _check_and_create_restock(db: Session, item: SupplyItem, applicant_id: Optio
             db.commit()
             db.refresh(request)
             db.refresh(alert)
+            await push_approval_notification(db, request)
+            await push_alert_notification(db, alert)
             return request, alert
     return None, None
 
@@ -69,8 +71,8 @@ def create_supply_item(
     return item
 
 
-@router.get("/items", response_model=List[SupplyItemResponse])
-def list_items(
+@router.get("/items")
+async def list_items(
     category: Optional[str] = None,
     low_stock_only: bool = False,
     db: Session = Depends(get_db),
@@ -80,16 +82,26 @@ def list_items(
     if category:
         query = query.filter(SupplyItem.category == category)
     items = query.all()
+
+    for item in items:
+        await _check_and_create_restock(db, item, current_user.id)
+
     if low_stock_only:
         items = [
             i for i in items
             if i.current_stock < i.safety_stock
         ]
-    return items
+
+    result = []
+    for i in items:
+        d = SupplyItemResponse.model_validate(i).model_dump()
+        d["is_below_safety"] = i.current_stock < i.safety_stock
+        result.append(d)
+    return result
 
 
-@router.get("/items/{item_id}", response_model=SupplyItemResponse)
-def get_item(
+@router.get("/items/{item_id}")
+async def get_item(
     item_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -97,7 +109,22 @@ def get_item(
     item = db.query(SupplyItem).filter(SupplyItem.id == item_id).first()
     if not item:
         raise HTTPException(status_code=404, detail="物资不存在")
-    return item
+
+    await _check_and_create_restock(db, item, current_user.id)
+    db.refresh(item)
+
+    d = SupplyItemResponse.model_validate(item).model_dump()
+    d["is_below_safety"] = item.current_stock < item.safety_stock
+
+    pending_req = db.query(RestockRequest).filter(
+        RestockRequest.supply_item_id == item.id,
+        RestockRequest.status == ApprovalStatus.PENDING
+    ).first()
+    if pending_req:
+        d["pending_restock_request_id"] = pending_req.id
+        d["pending_restock_quantity"] = pending_req.quantity
+
+    return d
 
 
 @router.put("/items/{item_id}/stock", response_model=SupplyItemResponse)
@@ -117,11 +144,7 @@ async def update_stock(
     db.commit()
     db.refresh(item)
 
-    request, alert = _check_and_create_restock(db, item, current_user.id)
-    if request and alert:
-        await push_approval_notification(db, request)
-        await push_alert_notification(db, alert)
-
+    await _check_and_create_restock(db, item, current_user.id)
     return item
 
 
@@ -142,12 +165,77 @@ async def consume_stock(
     db.commit()
     db.refresh(item)
 
-    request, alert = _check_and_create_restock(db, item, current_user.id)
-    if request and alert:
-        await push_approval_notification(db, request)
-        await push_alert_notification(db, alert)
-
+    await _check_and_create_restock(db, item, current_user.id)
     return item
+
+
+@router.get("/dashboard")
+def get_restock_dashboard(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    items = db.query(SupplyItem).all()
+    categories = {}
+    for item in items:
+        cat = item.category or "未分类"
+        if cat not in categories:
+            categories[cat] = {
+                "category": cat,
+                "low_stock_count": 0,
+                "pending_approval_count": 0,
+                "approved_pending_supply_count": 0,
+                "items": []
+            }
+
+        pending = db.query(RestockRequest).filter(
+            RestockRequest.supply_item_id == item.id,
+            RestockRequest.status == ApprovalStatus.PENDING
+        ).first()
+        approved = db.query(RestockRequest).filter(
+            RestockRequest.supply_item_id == item.id,
+            RestockRequest.status == ApprovalStatus.APPROVED,
+            RestockRequest.supplier_notified == False
+        ).first()
+
+        is_low = item.current_stock < item.safety_stock
+        if is_low:
+            categories[cat]["low_stock_count"] += 1
+        if pending:
+            categories[cat]["pending_approval_count"] += 1
+        if approved:
+            categories[cat]["approved_pending_supply_count"] += 1
+
+        if is_low or pending or approved:
+            categories[cat]["items"].append({
+                "item_id": item.id,
+                "name": item.name,
+                "code": item.code,
+                "current_stock": item.current_stock,
+                "safety_stock": item.safety_stock,
+                "unit": item.unit,
+                "is_low_stock": is_low,
+                "gap": max(0, item.safety_stock - item.current_stock),
+                "pending_request_id": pending.id if pending else None,
+                "pending_quantity": pending.quantity if pending else None,
+                "approved_request_id": approved.id if approved else None,
+                "approved_quantity": approved.quantity if approved else None
+            })
+
+    sorted_cats = sorted(
+        list(categories.values()),
+        key=lambda c: (
+            c["pending_approval_count"] * 3 + c["approved_pending_supply_count"] * 2 + c["low_stock_count"]
+        ),
+        reverse=True
+    )
+
+    return {
+        "total_categories": len(sorted_cats),
+        "total_low_stock": sum(c["low_stock_count"] for c in sorted_cats),
+        "total_pending_approval": sum(c["pending_approval_count"] for c in sorted_cats),
+        "total_approved_pending_supply": sum(c["approved_pending_supply_count"] for c in sorted_cats),
+        "categories": sorted_cats
+    }
 
 
 @router.get("/restock-requests", response_model=List[RestockRequestResponse])

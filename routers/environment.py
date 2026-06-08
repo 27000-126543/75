@@ -1,11 +1,12 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
 from config import settings
 from models import (
-    EnvironmentMonitor, EvacuationOrder, Alert, AlertLevel, User
+    EnvironmentMonitor, EvacuationOrder, Alert, AlertLevel, User,
+    SafetyEvent, SafetyEventStatus, EvacuationConfirmation, UserRole
 )
 from schemas import (
     EnvironmentDataCreate, EnvironmentMonitorResponse,
@@ -19,7 +20,68 @@ from services.notification_service import (
 router = APIRouter(prefix="/environment", tags=["环境监测与应急调度"])
 
 
-@router.post("/data", response_model=EnvironmentMonitorResponse)
+def _init_evacuation_confirmations(db: Session, evac_id: int):
+    existing = db.query(EvacuationConfirmation).filter(
+        EvacuationConfirmation.evacuation_id == evac_id
+    ).first()
+    if existing:
+        return
+    miners = db.query(User).filter(
+        User.role == UserRole.MINER,
+        User.is_active == True
+    ).all()
+    for m in miners:
+        conf = EvacuationConfirmation(evacuation_id=evac_id, user_id=m.id, confirmed=False)
+        db.add(conf)
+    db.commit()
+
+
+def _create_or_update_safety_event(
+    db: Session,
+    title: str,
+    description: str,
+    level: AlertLevel,
+    source_type: str,
+    area: str,
+    alert_id: Optional[int] = None,
+    evacuation_id: Optional[int] = None,
+    ventilation_active: bool = False
+) -> SafetyEvent:
+    active_event = db.query(SafetyEvent).filter(
+        SafetyEvent.area == area,
+        SafetyEvent.source_type == source_type,
+        SafetyEvent.status != SafetyEventStatus.RESOLVED
+    ).first()
+    if active_event:
+        active_event.level = level
+        active_event.description = description
+        if alert_id:
+            active_event.related_alert_id = alert_id
+        if evacuation_id:
+            active_event.related_evacuation_id = evacuation_id
+        active_event.ventilation_active = ventilation_active
+        active_event.status = SafetyEventStatus.HANDLING
+        db.commit()
+        db.refresh(active_event)
+        return active_event
+    event = SafetyEvent(
+        title=title,
+        description=description,
+        level=level,
+        source_type=source_type,
+        area=area,
+        status=SafetyEventStatus.HANDLING if evacuation_id else SafetyEventStatus.OPEN,
+        related_alert_id=alert_id,
+        related_evacuation_id=evacuation_id,
+        ventilation_active=ventilation_active
+    )
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+    return event
+
+
+@router.post("/data")
 async def upload_environment_data(
     data: EnvironmentDataCreate,
     db: Session = Depends(get_db),
@@ -38,6 +100,18 @@ async def upload_environment_data(
         ventilation_active=any_alert
     )
     db.add(monitor)
+
+    result = {
+        "id": None,
+        "area": data.area,
+        "gas_concentration": data.gas_concentration,
+        "dust_concentration": data.dust_concentration,
+        "gas_alert": gas_alert,
+        "dust_alert": dust_alert,
+        "ventilation_active": any_alert,
+        "safety_event_id": None,
+        "evacuation_order_id": None
+    }
 
     if any_alert:
         alert_reasons = []
@@ -63,12 +137,14 @@ async def upload_environment_data(
             area=data.area
         )
         db.add(alert)
+        db.flush()
 
         existing_evacuation = db.query(EvacuationOrder).filter(
             EvacuationOrder.area == data.area,
             EvacuationOrder.is_active == True
         ).first()
 
+        evacuation_id = None
         if not existing_evacuation:
             evacuation_level = AlertLevel.CRITICAL if gas_alert else AlertLevel.DANGER
             evacuation = EvacuationOrder(
@@ -78,11 +154,31 @@ async def upload_environment_data(
                 is_active=True
             )
             db.add(evacuation)
-            db.commit()
-            db.refresh(evacuation)
-            db.refresh(alert)
-            db.refresh(monitor)
+            db.flush()
+            evacuation_id = evacuation.id
+            _init_evacuation_confirmations(db, evacuation_id)
+        else:
+            evacuation_id = existing_evacuation.id
 
+        event = _create_or_update_safety_event(
+            db,
+            title=alert_title,
+            description=alert_content,
+            level=level,
+            source_type="environment",
+            area=data.area,
+            alert_id=alert.id,
+            evacuation_id=evacuation_id,
+            ventilation_active=any_alert
+        )
+        result["safety_event_id"] = event.id
+        result["evacuation_order_id"] = evacuation_id
+
+        db.commit()
+        db.refresh(monitor)
+        result["id"] = monitor.id
+
+        if not existing_evacuation:
             await push_alert_notification(db, alert)
             await push_evacuation_notification(db, evacuation)
             await push_system_notification(
@@ -92,15 +188,13 @@ async def upload_environment_data(
                 None
             )
         else:
-            db.commit()
-            db.refresh(alert)
-            db.refresh(monitor)
             await push_alert_notification(db, alert)
     else:
         db.commit()
         db.refresh(monitor)
+        result["id"] = monitor.id
 
-    return monitor
+    return result
 
 
 @router.get("/data", response_model=List[EnvironmentMonitorResponse])
@@ -177,7 +271,7 @@ def list_evacuations(
     return query.order_by(EvacuationOrder.created_at.desc()).all()
 
 
-@router.post("/evacuations/{evac_id}/cancel", response_model=EvacuationOrderResponse)
+@router.post("/evacuations/{evac_id}/cancel")
 async def cancel_evacuation(
     evac_id: int,
     db: Session = Depends(get_db),
@@ -191,13 +285,39 @@ async def cancel_evacuation(
     db.commit()
     db.refresh(evacuation)
 
+    event = db.query(SafetyEvent).filter(
+        SafetyEvent.related_evacuation_id == evac_id
+    ).first()
+    if event:
+        all_resolved = True
+        if event.related_alert_id:
+            alert = db.query(Alert).filter(Alert.id == event.related_alert_id).first()
+            if alert and not alert.is_resolved:
+                all_resolved = False
+        if event.related_work_order_id:
+            wo = db.query(SafetyEvent.related_work_order_id).first()
+            if wo and wo.status != "completed":
+                all_resolved = False
+        if all_resolved:
+            event.status = SafetyEventStatus.RESOLVED
+            event.resolved_at = datetime.utcnow()
+            db.commit()
+
     await push_system_notification(
         db,
         f"{evacuation.area}撤离指令已解除",
         "环境恢复正常，可恢复作业",
         None
     )
-    return evacuation
+    return {
+        "id": evacuation.id,
+        "area": evacuation.area,
+        "reason": evacuation.reason,
+        "is_active": evacuation.is_active,
+        "alert_level": evacuation.alert_level.value if hasattr(evacuation.alert_level, 'value') else str(evacuation.alert_level),
+        "created_at": evacuation.created_at,
+        "cancelled_at": evacuation.cancelled_at
+    }
 
 
 @router.post("/evacuations/manual", response_model=EvacuationOrderResponse)
