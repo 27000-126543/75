@@ -8,7 +8,7 @@ from models import (
     SafetyEvent, SafetyEventStatus, Alert, AlertLevel,
     EvacuationOrder, WorkOrder, WorkOrderStatus,
     EvacuationConfirmation, User, UserRole, EnvironmentMonitor,
-    SafetyEventActionLog, SafetyActionType, PushMessage, MessageType
+    SafetyEventActionLog, SafetyActionType, PushMessage, MessageType, MinerLocationReport
 )
 from routers.auth import get_current_user
 from services.notification_service import push_system_notification, push_alert_notification
@@ -116,6 +116,109 @@ def _get_event_current_stage(event: SafetyEvent, db: Session) -> Dict[str, Any]:
         if not current:
             current = "处置中"
     return {"stages": stages, "current_stage": current}
+
+
+STAGE_ACTION_MAP = {
+    "告警": [SafetyActionType.ALERT_TRIGGERED],
+    "通风处置": [SafetyActionType.VENTILATION_STARTED],
+    "撤离": [SafetyActionType.EVACUATION_ISSUED],
+    "撤离确认": [SafetyActionType.EVACUATION_CONFIRMED, SafetyActionType.EVACUATION_TIMEOUT],
+    "维修处置": [
+        SafetyActionType.WORK_ORDER_CREATED, SafetyActionType.WORK_ORDER_ASSIGNED,
+        SafetyActionType.WORK_ORDER_ACCEPTED, SafetyActionType.WORK_ORDER_REJECTED,
+        SafetyActionType.WORK_ORDER_REASSIGNED, SafetyActionType.WORK_ORDER_COMPLETED
+    ],
+    "撤离解除": [SafetyActionType.EVACUATION_CANCELLED],
+    "事件完结": [SafetyActionType.EVENT_RESOLVED]
+}
+
+
+def _build_event_review(db: Session, event: SafetyEvent) -> Dict[str, Any]:
+    logs = db.query(SafetyEventActionLog).filter(
+        SafetyEventActionLog.safety_event_id == event.id
+    ).order_by(SafetyEventActionLog.created_at.asc()).all()
+
+    stage_groups = {}
+    for stage_key, action_types in STAGE_ACTION_MAP.items():
+        stage_groups[stage_key] = {
+            "stage": stage_key,
+            "actions": [],
+            "start_time": None,
+            "end_time": None,
+            "duration_seconds": None,
+            "actors": [],
+            "is_blocked": False,
+            "pending_items": []
+        }
+
+    for log in logs:
+        matched = False
+        for stage_key, action_types in STAGE_ACTION_MAP.items():
+            if log.action_type in action_types:
+                detail = None
+                if log.detail_json:
+                    try:
+                        detail = json.loads(log.detail_json)
+                    except Exception:
+                        detail = None
+                action = {
+                    "id": log.id,
+                    "action_type": log.action_type.value if hasattr(log.action_type, 'value') else str(log.action_type),
+                    "description": log.description,
+                    "actor_id": log.actor_user_id,
+                    "actor_name": log.actor_name,
+                    "time": log.created_at,
+                    "detail": detail
+                }
+                stage_groups[stage_key]["actions"].append(action)
+                if log.actor_name and log.actor_name not in stage_groups[stage_key]["actors"]:
+                    stage_groups[stage_key]["actors"].append(log.actor_name)
+                matched = True
+                break
+        if not matched and log.action_type == SafetyActionType.NOTE:
+            pass
+
+    total_start = logs[0].created_at if logs else None
+    total_end = logs[-1].created_at if logs else None
+    overall_duration = None
+    if total_start and total_end:
+        overall_duration = int((total_end - total_start).total_seconds())
+
+    stage_info = _get_event_current_stage(event, db)
+    blocked_stages = [s["name"] for s in stage_info["stages"] if s.get("stuck") or (not s.get("done", True))]
+
+    pending_items = []
+    for s in stage_info["stages"]:
+        if not s.get("done", True):
+            pending_items.append(s["name"] + (f" {s.get('progress', '')}" if s.get("progress") else ""))
+
+    result = {
+        "stages": [],
+        "total_duration_seconds": overall_duration,
+        "start_time": total_start,
+        "end_time": total_end,
+        "blocked_stages": blocked_stages,
+        "pending_items": pending_items,
+        "bottleneck_stage": None,
+        "bottleneck_reason": None
+    }
+
+    max_duration = -1
+    for stage_key, sg in stage_groups.items():
+        if sg["actions"]:
+            sg["start_time"] = sg["actions"][0]["time"]
+            sg["end_time"] = sg["actions"][-1]["time"]
+            sg["duration_seconds"] = int((sg["end_time"] - sg["start_time"]).total_seconds())
+            if sg["duration_seconds"] > max_duration:
+                max_duration = sg["duration_seconds"]
+                result["bottleneck_stage"] = sg["stage"]
+                result["bottleneck_reason"] = f"{sg['stage']} 阶段耗时 {sg['duration_seconds']} 秒，为全流程最长"
+            if sg["stage"] in blocked_stages:
+                sg["is_blocked"] = True
+                sg["pending_items"] = [f"{sg['stage']} 未完成"]
+        result["stages"].append(sg)
+
+    return result
 
 
 @router.get("/events")
@@ -226,6 +329,11 @@ def get_safety_event_detail(
                             "name": u.full_name,
                             "phone": u.phone,
                             "area": c.area,
+                            "area_before_confirm": c.area_before_confirm,
+                            "confirm_location": c.confirm_location,
+                            "confirm_method": c.confirm_method,
+                            "confirmed": c.confirmed,
+                            "confirmed_at": c.confirmed_at,
                             "reminder_sent": c.reminder_sent,
                             "reminder_sent_at": c.reminder_sent_at,
                             "reminder_message_id": c.reminder_message_id,
@@ -246,6 +354,8 @@ def get_safety_event_detail(
                 "assigned_to": wo.assigned_to,
                 "assigned_to_name": worker.full_name if worker else None
             }
+
+    detail["review"] = _build_event_review(db, event)
 
     return detail
 
@@ -349,24 +459,27 @@ async def init_evacuation_confirmations(
         User.is_active == True
     ).all()
 
+    from routers.equipment import ADJACENT_AREAS
+    adjacent_areas = ADJACENT_AREAS.get(evac_area, [])
+    target_areas = {evac_area} | set(adjacent_areas) if evac_area else None
+
     created = 0
     for m in miners:
-        user_area = getattr(m, 'location_tag_id', None) or None
+        latest_loc = db.query(MinerLocationReport).filter(
+            MinerLocationReport.user_id == m.id
+        ).order_by(MinerLocationReport.reported_at.desc()).first()
+        user_area = latest_loc.area if latest_loc else getattr(m, 'location_tag_id', None)
+
         include = False
         if not evac_area or not user_area:
             include = True
-        elif user_area == evac_area:
+        elif target_areas and user_area in target_areas:
             include = True
-        else:
-            from routers.equipment import ADJACENT_AREAS
-            adjacent = ADJACENT_AREAS.get(evac_area, [])
-            if user_area in adjacent:
-                include = True
         if include:
             conf = EvacuationConfirmation(
                 evacuation_id=evac_id,
                 user_id=m.id,
-                area=evac_area,
+                area=user_area or evac_area,
                 confirmed=False
             )
             db.add(conf)
@@ -419,6 +532,11 @@ async def confirm_evacuation(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    latest_loc = db.query(MinerLocationReport).filter(
+        MinerLocationReport.user_id == current_user.id
+    ).order_by(MinerLocationReport.reported_at.desc()).first()
+    current_area = latest_loc.area if latest_loc else None
+
     conf = db.query(EvacuationConfirmation).filter(
         EvacuationConfirmation.evacuation_id == evac_id,
         EvacuationConfirmation.user_id == current_user.id
@@ -427,6 +545,7 @@ async def confirm_evacuation(
         conf = EvacuationConfirmation(
             evacuation_id=evac_id,
             user_id=current_user.id,
+            area_before_confirm=current_area,
             confirmed=True,
             confirmed_at=datetime.utcnow(),
             confirm_location=confirm_location,
@@ -434,6 +553,7 @@ async def confirm_evacuation(
         )
         db.add(conf)
     else:
+        conf.area_before_confirm = conf.area_before_confirm or current_area
         conf.confirmed = True
         conf.confirmed_at = datetime.utcnow()
         conf.confirm_location = confirm_location

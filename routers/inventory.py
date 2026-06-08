@@ -1,12 +1,13 @@
 from datetime import datetime
 from typing import List, Optional, Dict, Any
+from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
 from config import settings
 from models import (
     SupplyItem, RestockRequest, ApprovalStatus,
-    User, UserRole, Alert, AlertLevel
+    User, UserRole, Alert, AlertLevel, ShipmentStatus, RestockReceipt
 )
 from schemas import (
     SupplyItemCreate, SupplyItemResponse, StockUpdate,
@@ -194,7 +195,15 @@ def get_restock_dashboard(
         approved = db.query(RestockRequest).filter(
             RestockRequest.supply_item_id == item.id,
             RestockRequest.status == ApprovalStatus.APPROVED,
-            RestockRequest.supplier_notified == False
+            RestockRequest.shipment_status.in_([
+                ShipmentStatus.APPROVED_WAITING_SUPPLIER,
+                ShipmentStatus.IN_TRANSIT,
+                ShipmentStatus.DELIVERED
+            ])
+        ).first()
+        in_transit = db.query(RestockRequest).filter(
+            RestockRequest.supply_item_id == item.id,
+            RestockRequest.shipment_status == ShipmentStatus.IN_TRANSIT
         ).first()
 
         is_low = item.current_stock < item.safety_stock
@@ -204,8 +213,26 @@ def get_restock_dashboard(
             categories[cat]["pending_approval_count"] += 1
         if approved:
             categories[cat]["approved_pending_supply_count"] += 1
+        if in_transit:
+            categories[cat].setdefault("in_transit_count", 0)
+            categories[cat]["in_transit_count"] += 1
 
-        if is_low or pending or approved:
+        shipment_status = None
+        shipment_quantity = None
+        shipment_request_id = None
+        tracking = None
+        if approved:
+            shipment_status = approved.shipment_status.value if hasattr(approved.shipment_status, 'value') else str(approved.shipment_status)
+            shipment_quantity = approved.quantity
+            shipment_request_id = approved.id
+            tracking = approved.tracking_number
+        elif in_transit:
+            shipment_status = in_transit.shipment_status.value if hasattr(in_transit.shipment_status, 'value') else str(in_transit.shipment_status)
+            shipment_quantity = in_transit.quantity
+            shipment_request_id = in_transit.id
+            tracking = in_transit.tracking_number
+
+        if is_low or pending or approved or in_transit:
             categories[cat]["items"].append({
                 "item_id": item.id,
                 "name": item.name,
@@ -217,8 +244,10 @@ def get_restock_dashboard(
                 "gap": max(0, item.safety_stock - item.current_stock),
                 "pending_request_id": pending.id if pending else None,
                 "pending_quantity": pending.quantity if pending else None,
-                "approved_request_id": approved.id if approved else None,
-                "approved_quantity": approved.quantity if approved else None
+                "shipment_status": shipment_status,
+                "shipment_request_id": shipment_request_id,
+                "shipment_quantity": shipment_quantity,
+                "tracking_number": tracking
             })
 
     sorted_cats = sorted(
@@ -313,6 +342,9 @@ async def approve_restock_request(
 
     if data.approved:
         req.supplier_notified = True
+        req.shipment_status = ShipmentStatus.APPROVED_WAITING_SUPPLIER
+    else:
+        req.shipment_status = ShipmentStatus.CANCELLED
 
     db.commit()
     db.refresh(req)
@@ -330,3 +362,208 @@ async def approve_restock_request(
             )
 
     return req
+
+
+@router.post("/restock-requests/{request_id}/supplier-confirm")
+async def supplier_confirm_shipment(
+    request_id: int,
+    tracking_number: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role not in [UserRole.SUPPLIER, UserRole.ADMIN, UserRole.DISPATCHER]:
+        raise HTTPException(status_code=403, detail="无权限")
+
+    req = db.query(RestockRequest).filter(RestockRequest.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="申请不存在")
+    if req.status != ApprovalStatus.APPROVED:
+        raise HTTPException(status_code=400, detail="申请尚未审批通过")
+    if req.shipment_status not in [ShipmentStatus.APPROVED_WAITING_SUPPLIER, ShipmentStatus.DELIVERED]:
+        raise HTTPException(status_code=400, detail=f"当前状态{req.shipment_status}无法确认发货")
+
+    req.shipment_status = ShipmentStatus.IN_TRANSIT
+    req.supplier_confirmed_at = datetime.utcnow()
+    req.tracking_number = tracking_number
+    req.shipped_at = datetime.utcnow()
+    db.commit()
+    db.refresh(req)
+
+    item = db.query(SupplyItem).filter(SupplyItem.id == req.supply_item_id).first()
+    await push_system_notification(
+        db,
+        f"物资已发货: {item.name if item else '物资'}",
+        f"补货申请#{req.id}已发货，数量{req.quantity}，运单号:{tracking_number or '无'}",
+        [UserRole.MANAGER.value, UserRole.DISPATCHER.value]
+    )
+    return {
+        "message": "供应商已确认发货",
+        "request_id": req.id,
+        "shipment_status": req.shipment_status.value if hasattr(req.shipment_status, 'value') else str(req.shipment_status),
+        "tracking_number": req.tracking_number,
+        "shipped_at": req.shipped_at
+    }
+
+
+@router.post("/restock-requests/{request_id}/mark-delivered")
+async def mark_shipment_delivered(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    req = db.query(RestockRequest).filter(RestockRequest.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="申请不存在")
+    if req.shipment_status != ShipmentStatus.IN_TRANSIT:
+        raise HTTPException(status_code=400, detail="物资还未发货")
+
+    req.shipment_status = ShipmentStatus.DELIVERED
+    req.delivered_at = datetime.utcnow()
+    db.commit()
+    db.refresh(req)
+    return {
+        "message": "已标记为送达，等待验收入库",
+        "request_id": req.id,
+        "shipment_status": req.shipment_status.value if hasattr(req.shipment_status, 'value') else str(req.shipment_status),
+        "delivered_at": req.delivered_at
+    }
+
+
+class RestockReceiveIn(BaseModel):
+    received_quantity: float
+    qualified_quantity: Optional[float] = None
+    unqualified_quantity: Optional[float] = 0
+    inspection_result: str = "qualified"
+    inspection_remark: Optional[str] = None
+    batch_no: Optional[str] = None
+
+
+@router.post("/restock-requests/{request_id}/receive")
+async def receive_restock(
+    request_id: int,
+    data: RestockReceiveIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    req = db.query(RestockRequest).filter(RestockRequest.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="申请不存在")
+    if req.shipment_status not in [ShipmentStatus.DELIVERED, ShipmentStatus.IN_TRANSIT, ShipmentStatus.PARTIALLY_RECEIVED]:
+        raise HTTPException(status_code=400, detail="物资尚未送达或已完成入库")
+
+    item = db.query(SupplyItem).filter(SupplyItem.id == req.supply_item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="关联物资不存在")
+
+    qualified = data.qualified_quantity if data.qualified_quantity is not None else data.received_quantity
+    unqualified = data.unqualified_quantity or 0
+
+    if qualified < 0 or data.received_quantity < 0:
+        raise HTTPException(status_code=400, detail="入库数量不能为负数")
+
+    if qualified + unqualified > data.received_quantity + 0.0001:
+        raise HTTPException(status_code=400, detail="合格+不合格数量不能超过本批到货数量")
+
+    receipt = RestockReceipt(
+        restock_request_id=request_id,
+        batch_no=data.batch_no,
+        received_quantity=data.received_quantity,
+        qualified_quantity=qualified,
+        unqualified_quantity=unqualified,
+        inspection_result=data.inspection_result,
+        inspection_remark=data.inspection_remark,
+        received_by=current_user.id,
+        received_by_name=current_user.full_name,
+        created_at=datetime.utcnow()
+    )
+    db.add(receipt)
+
+    item.current_stock += qualified
+    item.last_restock = datetime.utcnow()
+
+    previous_receipts = db.query(RestockReceipt).filter(
+        RestockReceipt.restock_request_id == request_id
+    ).all()
+    total_qualified = qualified
+    for pr in previous_receipts:
+        total_qualified += (pr.qualified_quantity or 0)
+
+    if total_qualified >= req.quantity - 0.0001:
+        req.shipment_status = ShipmentStatus.RECEIVED
+    else:
+        req.shipment_status = ShipmentStatus.PARTIALLY_RECEIVED
+
+    req.received_quantity = (req.received_quantity or 0) + data.received_quantity
+    req.received_by = current_user.id
+    req.received_at = datetime.utcnow()
+    req.received_remark = data.inspection_remark or req.received_remark
+    db.commit()
+    db.refresh(req)
+    db.refresh(item)
+    db.refresh(receipt)
+
+    await push_system_notification(
+        db,
+        f"物资验收入库: {item.name}",
+        f"{item.name} 本批到货{data.received_quantity}{item.unit or ''}，合格{qualified}{item.unit or ''}，不合格{unqualified}{item.unit or ''}，由{current_user.full_name}验收" +
+        (f"，备注:{data.inspection_remark}" if data.inspection_remark else ""),
+        [UserRole.MANAGER.value, UserRole.DISPATCHER.value]
+    )
+
+    return {
+        "message": "入库成功",
+        "request_id": req.id,
+        "item_name": item.name,
+        "receipt_id": receipt.id,
+        "batch_no": data.batch_no,
+        "received_quantity": data.received_quantity,
+        "qualified_quantity": qualified,
+        "unqualified_quantity": unqualified,
+        "inspection_result": data.inspection_result,
+        "total_qualified_so_far": total_qualified,
+        "new_stock": item.current_stock,
+        "shipment_status": req.shipment_status.value if hasattr(req.shipment_status, 'value') else str(req.shipment_status),
+        "received_by": current_user.full_name,
+        "received_at": req.received_at
+    }
+
+
+@router.get("/restock-requests/{request_id}/receipts")
+def list_restock_receipts(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    req = db.query(RestockRequest).filter(RestockRequest.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="申请不存在")
+    receipts = db.query(RestockReceipt).filter(
+        RestockReceipt.restock_request_id == request_id
+    ).order_by(RestockReceipt.created_at.asc()).all()
+    result = []
+    total_qualified = 0
+    total_received = 0
+    for r in receipts:
+        total_qualified += (r.qualified_quantity or 0)
+        total_received += (r.received_quantity or 0)
+        result.append({
+            "id": r.id,
+            "batch_no": r.batch_no,
+            "received_quantity": r.received_quantity,
+            "qualified_quantity": r.qualified_quantity,
+            "unqualified_quantity": r.unqualified_quantity,
+            "inspection_result": r.inspection_result,
+            "inspection_remark": r.inspection_remark,
+            "received_by_id": r.received_by,
+            "received_by_name": r.received_by_name,
+            "created_at": r.created_at
+        })
+    return {
+        "request_id": request_id,
+        "requested_quantity": req.quantity,
+        "total_received": total_received,
+        "total_qualified": total_qualified,
+        "remaining_pending": max(req.quantity - total_qualified, 0),
+        "shipment_status": req.shipment_status.value if hasattr(req.shipment_status, 'value') else str(req.shipment_status),
+        "receipts": result
+    }

@@ -6,8 +6,10 @@ from database import get_db
 from config import settings
 from models import (
     EnvironmentMonitor, EvacuationOrder, Alert, AlertLevel, User,
-    SafetyEvent, SafetyEventStatus, EvacuationConfirmation, UserRole
+    SafetyEvent, SafetyEventStatus, EvacuationConfirmation, UserRole,
+    SafetyActionType, WorkOrder, WorkOrderStatus
 )
+from routers.safety import log_safety_action
 from schemas import (
     EnvironmentDataCreate, EnvironmentMonitorResponse,
     EvacuationOrderResponse
@@ -174,6 +176,15 @@ async def upload_environment_data(
         result["safety_event_id"] = event.id
         result["evacuation_order_id"] = evacuation_id
 
+        log_safety_action(db, event.id, SafetyActionType.ALERT_TRIGGERED,
+                          f"{data.area}环境告警: {alert_content}")
+        if any_alert:
+            log_safety_action(db, event.id, SafetyActionType.VENTILATION_STARTED,
+                              f"{data.area}通风设备已启动")
+        if not existing_evacuation:
+            log_safety_action(db, event.id, SafetyActionType.EVACUATION_ISSUED,
+                              f"下发撤离指令: {alert_content}")
+
         db.commit()
         db.refresh(monitor)
         result["id"] = monitor.id
@@ -308,6 +319,10 @@ async def cancel_evacuation(
             event.status = SafetyEventStatus.RESOLVED
             event.resolved_at = datetime.utcnow()
             db.commit()
+
+        if event:
+            log_safety_action(db, event.id, SafetyActionType.EVACUATION_CANCELLED,
+                              f"{evacuation.area}撤离指令已解除，环境恢复正常")
 
     await push_system_notification(
         db,

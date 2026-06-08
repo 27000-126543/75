@@ -8,8 +8,9 @@ from models import (
     MiningEquipment, EquipmentData, WorkOrder,
     WorkOrderStatus, User, UserRole, Alert, AlertLevel,
     MaintenanceWorkerState, WorkerStatus, SafetyEvent, SafetyEventStatus,
-    EvacuationOrder
+    EvacuationOrder, WorkOrderReassignment, SafetyActionType, ReassignmentType
 )
+from routers.safety import log_safety_action
 from schemas import (
     MiningEquipmentCreate, MiningEquipmentResponse,
     EquipmentDataCreate, EquipmentDataResponse,
@@ -103,12 +104,37 @@ def _workload_score(db: Session, worker_id: int) -> int:
     return 0
 
 
+def _worker_status_score(db: Session, worker: User) -> int:
+    state = db.query(MaintenanceWorkerState).filter(
+        MaintenanceWorkerState.user_id == worker.id
+    ).first()
+    if not state or state.status == WorkerStatus.IDLE:
+        return 3
+    if state.status == WorkerStatus.BUSY:
+        return 1
+    return 0
+
+
+def _eta_score(db: Session, worker: User) -> Tuple[int, int]:
+    state = db.query(MaintenanceWorkerState).filter(
+        MaintenanceWorkerState.user_id == worker.id
+    ).first()
+    eta = state.eta_minutes if state and state.eta_minutes else 0
+    if eta <= 5:
+        return 3, eta
+    elif eta <= 15:
+        return 2, eta
+    elif eta <= 30:
+        return 1, eta
+    return 0, eta
+
+
 def _find_best_maintenance_workers(
     db: Session,
     equipment_type: Optional[str],
     equipment_area: Optional[str],
     exclude_worker_ids: Optional[List[int]] = None
-) -> List[Tuple[int, int, int, int, User]]:
+) -> List[Tuple[int, int, int, int, int, int, int, User]]:
     exclude = exclude_worker_ids or []
     workers = db.query(User).filter(
         User.role == UserRole.MAINTENANCE,
@@ -126,10 +152,13 @@ def _find_best_maintenance_workers(
         skill_score = _skill_match_score(worker, equipment_type)
         area_score = _area_distance_score(worker_area, equipment_area)
         workload_score = _workload_score(db, worker.id)
-        total_score = skill_score * 10 + area_score * 5 + workload_score
-        scored_workers.append((total_score, skill_score, area_score, workload_score, worker))
+        status_score = _worker_status_score(db, worker)
+        eta_score, eta_min = _eta_score(db, worker)
+        # 技能10 + 区域5 + 忙闲6 + ETA3 + 工单负荷1
+        total_score = skill_score * 10 + area_score * 5 + status_score * 6 + eta_score * 3 + workload_score
+        scored_workers.append((total_score, skill_score, area_score, status_score, eta_score, eta_min, workload_score, worker))
 
-    scored_workers.sort(key=lambda x: (-x[0], -x[1], -x[2], -x[3]))
+    scored_workers.sort(key=lambda x: (-x[0], -x[1], -x[2], -x[3], -x[4], -x[6]))
     return scored_workers
 
 
@@ -137,24 +166,44 @@ def _build_assignment_rationale(
     db: Session,
     equipment_type: Optional[str],
     equipment_area: Optional[str],
-    top_workers: List[Tuple[int, int, int, int, User]],
+    top_workers: List[Tuple[int, int, int, int, int, int, int, User]],
     max_show: int = 3
 ) -> List[Dict[str, Any]]:
     rationale = []
-    for total, ss, as_, wl, worker in top_workers[:max_show]:
+    for total, ss, as_, sts, ets, eta, wl, worker in top_workers[:max_show]:
         worker_area = _get_worker_current_area(db, worker)
+        state = db.query(MaintenanceWorkerState).filter(
+            MaintenanceWorkerState.user_id == worker.id
+        ).first()
+        status_label = "离线"
+        if not state or state.status == WorkerStatus.IDLE:
+            status_label = "空闲"
+        elif state.status == WorkerStatus.BUSY:
+            status_label = "忙碌"
+        active_orders = db.query(WorkOrder).filter(
+            WorkOrder.assigned_to == worker.id,
+            WorkOrder.status.in_([WorkOrderStatus.PENDING, WorkOrderStatus.ASSIGNED, WorkOrderStatus.IN_PROGRESS])
+        ).count()
         rationale.append({
             "worker_id": worker.id,
             "worker_name": worker.full_name,
             "skills": worker.skills,
             "current_area": worker_area,
+            "status": status_label,
+            "eta_minutes": eta,
+            "active_work_orders": active_orders,
             "scores": {
-                "skill": ss,
-                "area": as_,
+                "skill_match": ss,
+                "area_distance": as_,
+                "worker_status": sts,
+                "eta": ets,
                 "workload": wl,
                 "total_weighted": total
             },
-            "reason": f"技能匹配{ss}分 + 区域距离{as_}分 + 工作负荷{wl}分 = {total}分(加权)"
+            "score_detail": (
+                f"技能匹配×10={ss * 10} + 区域距离×5={as_ * 5} + "
+                f"忙闲状态×6={sts * 6} + ETA×3={ets * 3} + 工单负荷={wl} = {total}"
+            )
         })
     return rationale
 
@@ -163,6 +212,31 @@ def _work_order_to_dict(order: WorkOrder, db: Session, include_rationale: bool =
     assigned_user = None
     if order.assigned_to:
         assigned_user = db.query(User).filter(User.id == order.assigned_to).first()
+    reassignments = db.query(WorkOrderReassignment).filter(
+        WorkOrderReassignment.work_order_id == order.id
+    ).order_by(WorkOrderReassignment.created_at.asc()).all()
+    reassignment_history = []
+    for r in reassignments:
+        rationale = None
+        if r.rationale_json:
+            try:
+                import json
+                rationale = json.loads(r.rationale_json)
+            except Exception:
+                rationale = None
+        reassignment_history.append({
+            "id": r.id,
+            "reassignment_type": r.reassignment_type.value if hasattr(r.reassignment_type, 'value') else str(r.reassignment_type),
+            "from_user_id": r.from_user_id,
+            "from_user_name": r.from_user_name,
+            "to_user_id": r.to_user_id,
+            "to_user_name": r.to_user_name,
+            "reason": r.reason,
+            "operator_user_id": r.operator_user_id,
+            "operator_name": r.operator_name,
+            "rationale": rationale,
+            "created_at": r.created_at
+        })
     d = {
         "id": order.id,
         "title": order.title,
@@ -173,9 +247,13 @@ def _work_order_to_dict(order: WorkOrder, db: Session, include_rationale: bool =
         "assigned_to_skills": assigned_user.skills if assigned_user else None,
         "status": order.status.value if hasattr(order.status, 'value') else str(order.status),
         "priority": order.priority,
+        "rejected_by": order.rejected_by if hasattr(order, 'rejected_by') else None,
+        "reassigned_count": order.reassigned_count if hasattr(order, 'reassigned_count') else 0,
+        "reassignment_history": reassignment_history,
+        "assigned_at": order.assigned_at if hasattr(order, 'assigned_at') else None,
+        "accepted_at": order.accepted_at if hasattr(order, 'accepted_at') else None,
         "created_at": order.created_at,
-        "completed_at": order.completed_at,
-        "reassigned_count": order.reassigned_count if hasattr(order, 'reassigned_count') else 0
+        "completed_at": order.completed_at
     }
     if include_rationale and order.equipment_id:
         equip = db.query(MiningEquipment).filter(MiningEquipment.id == order.equipment_id).first()
@@ -300,7 +378,7 @@ async def upload_equipment_data(
 
         if not existing_order:
             scored_workers = _find_best_maintenance_workers(db, equip.type, equip.location_area)
-            top_worker = scored_workers[0][4] if scored_workers else None
+            top_worker = scored_workers[0][7] if scored_workers else None
             priority = "high" if data.temperature > settings.TEMPERATURE_THRESHOLD else "medium"
 
             work_order = WorkOrder(
@@ -355,6 +433,14 @@ async def upload_equipment_data(
             db.refresh(alert)
             db.refresh(event)
             db.refresh(equip_data)
+
+            log_safety_action(db, event.id, SafetyActionType.WORK_ORDER_CREATED,
+                              f"生成检修工单#{work_order.id}")
+            if top_worker:
+                log_safety_action(db, event.id, SafetyActionType.WORK_ORDER_ASSIGNED,
+                                  f"工单派给 {top_worker.full_name}",
+                                  top_worker,
+                                  {"worker_id": top_worker.id, "worker_skills": top_worker.skills})
 
             result["id"] = equip_data.id
             result["work_order_id"] = work_order.id
@@ -491,6 +577,11 @@ def complete_work_order(
 
     db.commit()
     db.refresh(order)
+    event = db.query(SafetyEvent).filter(SafetyEvent.related_work_order_id == order.id).first()
+    if event:
+        log_safety_action(db, event.id, SafetyActionType.WORK_ORDER_COMPLETED,
+                          f"{current_user.full_name} 完成工单", current_user,
+                          {"order_id": order.id, "completed_at": str(order.completed_at)})
     _resolve_safety_event_for_work_order(db, order.id)
     return _work_order_to_dict(order, db, include_rationale=True)
 
@@ -575,6 +666,11 @@ async def accept_work_order(
     db.commit()
     db.refresh(order)
 
+    event = db.query(SafetyEvent).filter(SafetyEvent.related_work_order_id == order.id).first()
+    if event:
+        log_safety_action(db, event.id, SafetyActionType.WORK_ORDER_ACCEPTED,
+                          f"{current_user.full_name} 已接单", current_user)
+
     await push_system_notification(
         db,
         f"工单已接单: {order.title}",
@@ -616,6 +712,12 @@ async def reject_work_order(
             if u:
                 exclude_ids.append(u.id)
 
+    event = db.query(SafetyEvent).filter(SafetyEvent.related_work_order_id == order.id).first()
+    if event:
+        log_safety_action(db, event.id, SafetyActionType.WORK_ORDER_REJECTED,
+                          f"{rejected_name} 拒单，原因: {reason}", current_user,
+                          {"reason": reason})
+
     next_workers = _find_best_maintenance_workers(db, equip_type, equip_area, exclude_ids)
 
     if not next_workers:
@@ -631,12 +733,32 @@ async def reject_work_order(
         )
         return _work_order_to_dict(order, db)
 
-    next_worker = next_workers[0][4]
+    next_worker = next_workers[0][7]
+    rationale = _build_assignment_rationale(db, equip_type, equip_area, next_workers)
+    import json
+    reassignment = WorkOrderReassignment(
+        work_order_id=order.id,
+        reassignment_type=ReassignmentType.REJECT_AUTO,
+        from_user_id=current_user.id,
+        from_user_name=rejected_name,
+        to_user_id=next_worker.id,
+        to_user_name=next_worker.full_name,
+        reason=f"拒单: {reason}",
+        rationale_json=json.dumps(rationale, ensure_ascii=False)
+    )
+    db.add(reassignment)
+
     order.assigned_to = next_worker.id
     order.status = WorkOrderStatus.ASSIGNED
     order.assigned_at = datetime.utcnow()
     db.commit()
     db.refresh(order)
+
+    if event:
+        log_safety_action(db, event.id, SafetyActionType.WORK_ORDER_REASSIGNED,
+                          f"自动改派给 {next_worker.full_name}",
+                          None,
+                          {"from": rejected_name, "to": next_worker.full_name, "reason": reason})
 
     await push_work_order_notification(db, order, next_worker)
     await push_system_notification(
@@ -646,7 +768,7 @@ async def reject_work_order(
     )
 
     result = _work_order_to_dict(order, db)
-    result["assignment_rationale"] = _build_assignment_rationale(db, equip_type, equip_area, next_workers)
+    result["assignment_rationale"] = rationale
     return result
 
 
@@ -678,14 +800,35 @@ async def check_work_order_timeout(
             next_workers = _find_best_maintenance_workers(db, equip_type, equip_area, exclude_ids)
             if next_workers:
                 old_worker = db.query(User).filter(User.id == current_assignee).first() if current_assignee else None
-                next_worker = next_workers[0][4]
+                next_worker = next_workers[0][7]
+                old_name = old_worker.full_name if old_worker else f"ID{current_assignee}"
+                rationale = _build_assignment_rationale(db, equip_type, equip_area, next_workers)
+                import json
+                reassignment = WorkOrderReassignment(
+                    work_order_id=order.id,
+                    reassignment_type=ReassignmentType.TIMEOUT_AUTO,
+                    from_user_id=current_assignee,
+                    from_user_name=old_name,
+                    to_user_id=next_worker.id,
+                    to_user_name=next_worker.full_name,
+                    reason=f"超时{WORK_ORDER_ACCEPT_TIMEOUT_MINUTES}分钟未接单",
+                    rationale_json=json.dumps(rationale, ensure_ascii=False)
+                )
+                db.add(reassignment)
+
                 order.assigned_to = next_worker.id
                 order.reassigned_count = (order.reassigned_count or 0) + 1
                 order.assigned_at = datetime.utcnow()
-                old_name = old_worker.full_name if old_worker else f"ID{current_assignee}"
                 order.rejected_by = f"{order.rejected_by},{old_name}(超时)" if order.rejected_by else f"{old_name}(超时)"
                 db.commit()
                 db.refresh(order)
+
+                event = db.query(SafetyEvent).filter(SafetyEvent.related_work_order_id == order.id).first()
+                if event:
+                    log_safety_action(db, event.id, SafetyActionType.WORK_ORDER_REASSIGNED,
+                                      f"超时未接单，自动改派给 {next_worker.full_name}",
+                                      None,
+                                      {"from": old_name, "to": next_worker.full_name, "reason": "超时未接单"})
 
                 await push_work_order_notification(db, order, next_worker)
                 reassigned.append({
@@ -699,3 +842,74 @@ async def check_work_order_timeout(
         "message": f"已检查{len(timeout_orders)}个已分配工单，{len(reassigned)}个因超时已自动改派",
         "reassigned": reassigned
     }
+
+
+class ManualReassignIn(BaseModel):
+    to_user_id: int
+    reason: str
+
+
+@router.post("/work-orders/{order_id}/manual-reassign")
+async def manual_reassign_work_order(
+    order_id: int,
+    data: ManualReassignIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    order = db.query(WorkOrder).filter(WorkOrder.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="工单不存在")
+    if order.status == WorkOrderStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="已完工工单不可改派")
+
+    new_worker = db.query(User).filter(User.id == data.to_user_id).first()
+    if not new_worker:
+        raise HTTPException(status_code=400, detail="目标维修工不存在")
+
+    old_user = db.query(User).filter(User.id == order.assigned_to).first() if order.assigned_to else None
+    old_name = old_user.full_name if old_user else None
+
+    equip = db.query(MiningEquipment).filter(MiningEquipment.id == order.equipment_id).first()
+    equip_type = equip.type if equip else None
+    equip_area = equip.location_area if equip else None
+
+    next_workers = _find_best_maintenance_workers(db, equip_type, equip_area, [])
+    rationale = _build_assignment_rationale(db, equip_type, equip_area, next_workers)
+    import json
+    reassignment = WorkOrderReassignment(
+        work_order_id=order.id,
+        reassignment_type=ReassignmentType.DISPATCHER_MANUAL,
+        from_user_id=order.assigned_to,
+        from_user_name=old_name,
+        to_user_id=new_worker.id,
+        to_user_name=new_worker.full_name,
+        reason=data.reason,
+        operator_user_id=current_user.id,
+        operator_name=current_user.full_name,
+        rationale_json=json.dumps(rationale, ensure_ascii=False)
+    )
+    db.add(reassignment)
+
+    order.assigned_to = new_worker.id
+    order.status = WorkOrderStatus.ASSIGNED
+    order.reassigned_count = (order.reassigned_count or 0) + 1
+    order.assigned_at = datetime.utcnow()
+    db.commit()
+    db.refresh(order)
+
+    event = db.query(SafetyEvent).filter(SafetyEvent.related_work_order_id == order.id).first()
+    if event:
+        log_safety_action(db, event.id, SafetyActionType.WORK_ORDER_REASSIGNED,
+                          f"调度{current_user.full_name} 手动改派: {old_name or '无'} → {new_worker.full_name}",
+                          current_user,
+                          {"from": old_name, "to": new_worker.full_name, "reason": data.reason, "manual": True})
+
+    await push_work_order_notification(db, order, new_worker)
+    await push_system_notification(
+        db,
+        f"工单调度改派: {order.title}",
+        f"调度{current_user.full_name}手动改派: {old_name or '无'} → {new_worker.full_name}，原因:{data.reason}"
+    )
+
+    result = _work_order_to_dict(order, db, include_rationale=True)
+    return result

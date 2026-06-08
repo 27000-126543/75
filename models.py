@@ -40,6 +40,16 @@ class ApprovalStatus(str, enum.Enum):
     REJECTED = "rejected"
 
 
+class ShipmentStatus(str, enum.Enum):
+    PENDING_APPROVAL = "pending_approval"
+    APPROVED_WAITING_SUPPLIER = "approved_waiting_supplier"
+    IN_TRANSIT = "in_transit"
+    DELIVERED = "delivered"
+    PARTIALLY_RECEIVED = "partially_received"
+    RECEIVED = "received"
+    CANCELLED = "cancelled"
+
+
 class TransportStatus(str, enum.Enum):
     IDLE = "idle"
     ASSIGNED = "assigned"
@@ -310,6 +320,7 @@ class EvacuationConfirmation(Base):
     evacuation_id = Column(Integer, ForeignKey("evacuation_orders.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     area = Column(String(100))
+    area_before_confirm = Column(String(100))
     confirmed = Column(Boolean, default=False)
     confirmed_at = Column(DateTime)
     confirm_location = Column(String(200))
@@ -365,22 +376,47 @@ class SafetyEventActionLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-class ShipmentStatus(str, enum.Enum):
-    PENDING_APPROVAL = "pending_approval"
-    APPROVED_WAITING_SUPPLIER = "approved_waiting_supplier"
-    IN_TRANSIT = "in_transit"
-    DELIVERED = "delivered"
-    RECEIVED = "received"
-    CANCELLED = "cancelled"
+class ReassignmentType(str, enum.Enum):
+    AUTO_INITIAL = "auto_initial"
+    REJECT_AUTO = "reject_auto"
+    TIMEOUT_AUTO = "timeout_auto"
+    DISPATCHER_MANUAL = "dispatcher_manual"
 
 
 class WorkOrderReassignment(Base):
     __tablename__ = "work_order_reassignments"
     id = Column(Integer, primary_key=True, index=True)
     work_order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=False)
+    reassignment_type = Column(SQLEnum(ReassignmentType), default=ReassignmentType.AUTO_INITIAL)
     from_user_id = Column(Integer, ForeignKey("users.id"))
     from_user_name = Column(String(100))
     to_user_id = Column(Integer, ForeignKey("users.id"))
     to_user_name = Column(String(100))
     reason = Column(String(500))
+    rationale_json = Column(Text)
+    operator_user_id = Column(Integer, ForeignKey("users.id"))
+    operator_name = Column(String(100))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class MinerLocationReport(Base):
+    __tablename__ = "miner_location_reports"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    area = Column(String(100), nullable=False)
+    reported_at = Column(DateTime, default=datetime.utcnow)
+
+
+class RestockReceipt(Base):
+    __tablename__ = "restock_receipts"
+    id = Column(Integer, primary_key=True, index=True)
+    restock_request_id = Column(Integer, ForeignKey("restock_requests.id"), nullable=False)
+    batch_no = Column(String(100))
+    received_quantity = Column(Float, default=0)
+    qualified_quantity = Column(Float, default=0)
+    unqualified_quantity = Column(Float, default=0)
+    inspection_result = Column(String(50))
+    inspection_remark = Column(Text)
+    received_by = Column(Integer, ForeignKey("users.id"))
+    received_by_name = Column(String(100))
     created_at = Column(DateTime, default=datetime.utcnow)

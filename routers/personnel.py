@@ -1,9 +1,11 @@
 from typing import List
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from database import get_db
 from config import settings
-from models import User, PersonnelCheck, UserRole
+from models import User, PersonnelCheck, UserRole, MinerLocationReport
 from schemas import PersonnelCheckCreate, PersonnelCheckResponse
 from routers.auth import get_current_user
 from services.notification_service import push_security_notification
@@ -111,3 +113,40 @@ def get_check(
     if not check:
         raise HTTPException(status_code=404, detail="记录不存在")
     return check
+
+
+class LocationReportIn(BaseModel):
+    user_id: int
+    area: str
+
+
+@router.post("/location-report")
+def report_location(
+    data: LocationReportIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    user = db.query(User).filter(User.id == data.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    report = MinerLocationReport(user_id=data.user_id, area=data.area, reported_at=datetime.utcnow())
+    db.add(report)
+    db.commit()
+    db.refresh(report)
+    return {"id": report.id, "user_id": data.user_id, "area": data.area, "reported_at": report.reported_at,
+            "message": "位置上报成功"}
+
+
+@router.get("/location/latest/{user_id}")
+def get_latest_location(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    report = db.query(MinerLocationReport).filter(MinerLocationReport.user_id == user_id).order_by(
+        MinerLocationReport.reported_at.desc()).first()
+    return {
+        "user_id": user_id,
+        "area": report.area if report else None,
+        "reported_at": report.reported_at if report else None
+    }
