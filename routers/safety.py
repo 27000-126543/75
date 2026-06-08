@@ -1,0 +1,348 @@
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from database import get_db
+from models import (
+    SafetyEvent, SafetyEventStatus, Alert, AlertLevel,
+    EvacuationOrder, WorkOrder, WorkOrderStatus,
+    EvacuationConfirmation, User, UserRole, EnvironmentMonitor
+)
+from routers.auth import get_current_user
+from services.notification_service import push_system_notification, push_alert_notification
+
+router = APIRouter(prefix="/safety", tags=["安全事件与应急闭环"])
+
+EVACUATION_CONFIRM_TIMEOUT_MINUTES = 5
+
+
+def _create_safety_event(
+    db: Session,
+    title: str,
+    description: str,
+    level: AlertLevel,
+    source_type: str,
+    area: str,
+    alert_id: Optional[int] = None,
+    evacuation_id: Optional[int] = None,
+    work_order_id: Optional[int] = None,
+    ventilation_active: bool = False
+) -> SafetyEvent:
+    event = SafetyEvent(
+        title=title,
+        description=description,
+        level=level,
+        source_type=source_type,
+        area=area,
+        status=SafetyEventStatus.HANDLING if (evacuation_id or work_order_id) else SafetyEventStatus.OPEN,
+        related_alert_id=alert_id,
+        related_evacuation_id=evacuation_id,
+        related_work_order_id=work_order_id,
+        ventilation_active=ventilation_active
+    )
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+    return event
+
+
+def _check_and_resolve_event(db: Session, event: SafetyEvent):
+    if not event:
+        return
+    all_resolved = True
+    if event.related_alert_id:
+        alert = db.query(Alert).filter(Alert.id == event.related_alert_id).first()
+        if alert and not alert.is_resolved:
+            all_resolved = False
+    if event.related_evacuation_id:
+        evac = db.query(EvacuationOrder).filter(EvacuationOrder.id == event.related_evacuation_id).first()
+        if evac and evac.is_active:
+            all_resolved = False
+    if event.related_work_order_id:
+        wo = db.query(WorkOrder).filter(WorkOrder.id == event.related_work_order_id).first()
+        if wo and wo.status != WorkOrderStatus.COMPLETED:
+            all_resolved = False
+    if event.ventilation_active:
+        latest = db.query(EnvironmentMonitor).filter(
+            EnvironmentMonitor.area == event.area
+        ).order_by(EnvironmentMonitor.collected_at.desc()).first()
+        if latest and latest.ventilation_active:
+            all_resolved = False
+    if all_resolved and event.status != SafetyEventStatus.RESOLVED:
+        event.status = SafetyEventStatus.RESOLVED
+        event.resolved_at = datetime.utcnow()
+        db.commit()
+        db.refresh(event)
+
+
+@router.get("/events")
+def list_safety_events(
+    status: Optional[SafetyEventStatus] = None,
+    area: Optional[str] = None,
+    level: Optional[AlertLevel] = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    query = db.query(SafetyEvent)
+    if status:
+        query = query.filter(SafetyEvent.status == status)
+    if area:
+        query = query.filter(SafetyEvent.area == area)
+    if level:
+        query = query.filter(SafetyEvent.level == level)
+    events = query.order_by(SafetyEvent.created_at.desc()).limit(limit).all()
+    result = []
+    for e in events:
+        d = {
+            "id": e.id,
+            "title": e.title,
+            "description": e.description,
+            "level": e.level.value if hasattr(e.level, 'value') else str(e.level),
+            "source_type": e.source_type,
+            "area": e.area,
+            "status": e.status.value if hasattr(e.status, 'value') else str(e.status),
+            "related_alert_id": e.related_alert_id,
+            "related_evacuation_id": e.related_evacuation_id,
+            "related_work_order_id": e.related_work_order_id,
+            "ventilation_active": e.ventilation_active,
+            "created_at": e.created_at,
+            "resolved_at": e.resolved_at
+        }
+        result.append(d)
+    return result
+
+
+@router.get("/events/{event_id}")
+def get_safety_event_detail(
+    event_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    event = db.query(SafetyEvent).filter(SafetyEvent.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="安全事件不存在")
+
+    _check_and_resolve_event(db, event)
+    db.refresh(event)
+
+    detail = {
+        "id": event.id,
+        "title": event.title,
+        "description": event.description,
+        "level": event.level.value,
+        "source_type": event.source_type,
+        "area": event.area,
+        "status": event.status.value,
+        "ventilation_active": event.ventilation_active,
+        "created_at": event.created_at,
+        "resolved_at": event.resolved_at,
+        "alert": None,
+        "evacuation": None,
+        "work_order": None,
+        "unconfirmed_users": []
+    }
+
+    if event.related_alert_id:
+        alert = db.query(Alert).filter(Alert.id == event.related_alert_id).first()
+        if alert:
+            detail["alert"] = {
+                "id": alert.id,
+                "title": alert.title,
+                "content": alert.content,
+                "is_resolved": alert.is_resolved
+            }
+
+    if event.related_evacuation_id:
+        evac = db.query(EvacuationOrder).filter(EvacuationOrder.id == event.related_evacuation_id).first()
+        if evac:
+            detail["evacuation"] = {
+                "id": evac.id,
+                "area": evac.area,
+                "reason": evac.reason,
+                "is_active": evac.is_active,
+                "alert_level": evac.alert_level.value
+            }
+            confirmations = db.query(EvacuationConfirmation).filter(
+                EvacuationConfirmation.evacuation_id == evac.id
+            ).all()
+            unconfirmed = []
+            for c in confirmations:
+                if not c.confirmed:
+                    u = db.query(User).filter(User.id == c.user_id).first()
+                    if u:
+                        unconfirmed.append({
+                            "user_id": u.id,
+                            "name": u.full_name,
+                            "phone": u.phone,
+                            "reminder_sent": c.reminder_sent,
+                            "created_at": c.created_at
+                        })
+            detail["unconfirmed_users"] = unconfirmed
+
+    if event.related_work_order_id:
+        wo = db.query(WorkOrder).filter(WorkOrder.id == event.related_work_order_id).first()
+        if wo:
+            worker = db.query(User).filter(User.id == wo.assigned_to).first() if wo.assigned_to else None
+            detail["work_order"] = {
+                "id": wo.id,
+                "title": wo.title,
+                "description": wo.description,
+                "status": wo.status.value,
+                "priority": wo.priority,
+                "assigned_to": wo.assigned_to,
+                "assigned_to_name": worker.full_name if worker else None
+            }
+
+    return detail
+
+
+@router.post("/events/{event_id}/resolve")
+async def resolve_safety_event(
+    event_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    event = db.query(SafetyEvent).filter(SafetyEvent.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="安全事件不存在")
+    event.status = SafetyEventStatus.RESOLVED
+    event.resolved_at = datetime.utcnow()
+    db.commit()
+    db.refresh(event)
+
+    await push_system_notification(
+        db,
+        f"安全事件已处置: {event.title}",
+        f"区域[{event.area}]事件已由{current_user.full_name}处置完成"
+    )
+    return {"message": "事件已标记为已处置", "event_id": event.id}
+
+
+@router.post("/evacuations/{evac_id}/init-confirmations")
+async def init_evacuation_confirmations(
+    evac_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    evac = db.query(EvacuationOrder).filter(EvacuationOrder.id == evac_id).first()
+    if not evac:
+        raise HTTPException(status_code=404, detail="撤离指令不存在")
+
+    existing = db.query(EvacuationConfirmation).filter(
+        EvacuationConfirmation.evacuation_id == evac_id
+    ).first()
+    if existing:
+        return {"message": "确认清单已初始化", "evacuation_id": evac_id}
+
+    miners = db.query(User).filter(
+        User.role == UserRole.MINER,
+        User.is_active == True
+    ).all()
+
+    created = 0
+    for m in miners:
+        conf = EvacuationConfirmation(
+            evacuation_id=evac_id,
+            user_id=m.id,
+            confirmed=False
+        )
+        db.add(conf)
+        created += 1
+
+    db.commit()
+    return {"message": f"已为{created}名矿工生成撤离确认清单", "evacuation_id": evac_id}
+
+
+@router.get("/evacuations/{evac_id}/unconfirmed")
+def get_unconfirmed_users(
+    evac_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    evac = db.query(EvacuationOrder).filter(EvacuationOrder.id == evac_id).first()
+    if not evac:
+        raise HTTPException(status_code=404, detail="撤离指令不存在")
+
+    confirmations = db.query(EvacuationConfirmation).filter(
+        EvacuationConfirmation.evacuation_id == evac_id,
+        EvacuationConfirmation.confirmed == False
+    ).all()
+
+    result = []
+    for c in confirmations:
+        user = db.query(User).filter(User.id == c.user_id).first()
+        if user:
+            timeout = (datetime.utcnow() - c.created_at) > timedelta(minutes=EVACUATION_CONFIRM_TIMEOUT_MINUTES)
+            result.append({
+                "confirmation_id": c.id,
+                "user_id": user.id,
+                "user_name": user.full_name,
+                "phone": user.phone,
+                "created_at": c.created_at,
+                "reminder_sent": c.reminder_sent,
+                "is_timeout": timeout
+            })
+    return result
+
+
+@router.post("/evacuations/{evac_id}/confirm")
+async def confirm_evacuation(
+    evac_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    conf = db.query(EvacuationConfirmation).filter(
+        EvacuationConfirmation.evacuation_id == evac_id,
+        EvacuationConfirmation.user_id == current_user.id
+    ).first()
+    if not conf:
+        conf = EvacuationConfirmation(
+            evacuation_id=evac_id,
+            user_id=current_user.id,
+            confirmed=True,
+            confirmed_at=datetime.utcnow()
+        )
+        db.add(conf)
+    else:
+        conf.confirmed = True
+        conf.confirmed_at = datetime.utcnow()
+    db.commit()
+    db.refresh(conf)
+    return {"message": "撤离确认成功", "confirmed_at": conf.confirmed_at}
+
+
+@router.post("/evacuations/{evac_id}/check-timeout")
+async def check_evacuation_timeout(
+    evac_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    unconfirmed = db.query(EvacuationConfirmation).filter(
+        EvacuationConfirmation.evacuation_id == evac_id,
+        EvacuationConfirmation.confirmed == False,
+        EvacuationConfirmation.reminder_sent == False
+    ).all()
+
+    timeout_users = []
+    for c in unconfirmed:
+        if (datetime.utcnow() - c.created_at) > timedelta(minutes=EVACUATION_CONFIRM_TIMEOUT_MINUTES):
+            user = db.query(User).filter(User.id == c.user_id).first()
+            if user:
+                c.reminder_sent = True
+                timeout_users.append(user.full_name)
+
+    db.commit()
+
+    if timeout_users:
+        await push_system_notification(
+            db,
+            f"撤离超时提醒: {len(timeout_users)}人未确认",
+            f"以下矿工超时未确认撤离: {', '.join(timeout_users)}",
+            [UserRole.SECURITY.value, UserRole.DISPATCHER.value]
+        )
+
+    return {
+        "message": f"已检查，{len(timeout_users)}人超时未确认，已发送提醒",
+        "timeout_users": timeout_users
+    }
