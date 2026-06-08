@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import settings
 from database import engine, SessionLocal, Base
 from models import User, UserRole, SupplyItem, Crusher, MiningEquipment, TransportVehicle
-from routers import auth, personnel, equipment, environment, transport, ore_quality, inventory, reports, notifications
+from routers import auth, personnel, equipment, environment, transport, ore_quality, inventory, reports, notifications, safety
 from scheduler import start_scheduler, shutdown_scheduler
 
 logging.basicConfig(level=logging.INFO)
@@ -150,6 +150,7 @@ app.include_router(ore_quality.router, prefix=settings.API_PREFIX)
 app.include_router(inventory.router, prefix=settings.API_PREFIX)
 app.include_router(reports.router, prefix=settings.API_PREFIX)
 app.include_router(notifications.router, prefix=settings.API_PREFIX)
+app.include_router(safety.router, prefix=settings.API_PREFIX)
 
 
 @app.get("/")

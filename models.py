@@ -126,6 +126,10 @@ class WorkOrder(Base):
     priority = Column(String(20), default="medium")
     abnormal_data_id = Column(Integer, ForeignKey("equipment_data.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
+    assigned_at = Column(DateTime)
+    accepted_at = Column(DateTime)
+    rejected_by = Column(String(255))
+    reassigned_count = Column(Integer, default=0)
     completed_at = Column(DateTime)
 
 
